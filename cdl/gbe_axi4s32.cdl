@@ -1,0 +1,767 @@
+/** @copyright (C) 2019,  Gavin J Stark.  All rights reserved.
+ *
+ * @copyright
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *     http://www.apache.org/licenses/LICENSE-2.0.
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *
+ * @file   gbe_axi4s32.cdl
+ * @brief  GbE MAC (supporting 10/100/1000) full duplex using AXI-4S to GMII
+ *
+ * CDL implementation of a fully synchronous GbE MAC
+ *
+ * The implementation is very lightweight. It requires that data in be valid
+ * for a packet, once started, until the end of the packet.
+ *
+ */
+/*a To do
+ * Optionally (configurable) insert timestamp in to packet
+ *   This has to be done prior to FCS calculation
+ *   Hence for optimium accuracy the connection between this and the PHY should
+ *   not have a FIFO, but should be just a register. Clock domain crossings should
+ *   be minimalized.
+ * 
+ * Fix Rx error and status reporting which is crap
+ *
+ * Pause frame generation (?), pause frame interpretation (?)
+ *
+ * 10/100 support should already exist - the gmii will clock enable on tx and rx
+ * as required
+ *
+ * 2.5GbE should be supported if the GMII clocks run fast enough (>312.5MHz)
+ *
+ * Set packet_stat
+ * Ack for packet_stat
+ *
+ */
+/*a Includes */
+include "clocking::clock_timer.h"
+include "networking::axi4s.h"
+include "networking::networking.h"
+include "ethernet.h"
+include "clocking::clock_timer_modules.h"
+
+/*a Constants
+*/
+constant integer preamble_length=8; // 7 of 0x55 one of 0xd5
+constant integer disable_rx_timer=0;
+constant integer disable_padding=0;
+
+/*a Types */
+/*t t_tx_fsm */
+typedef fsm {
+    tx_fsm_idle {
+        tx_fsm_preamble
+            } "Waiting for valid data in";
+    tx_fsm_preamble {
+        tx_fsm_data
+            } "Outputting preamble";
+    tx_fsm_data  {
+        tx_fsm_padding, tx_fsm_fcs, tx_fsm_aborting
+            }         "Outputting data, calculating FCS";
+    tx_fsm_padding {
+        tx_fsm_fcs
+            }       "Outputting padding byte, calculating FCS";
+    tx_fsm_fcs {
+        tx_fsm_ipg
+            }           "Outputting FCS";
+    tx_fsm_ipg {
+        tx_fsm_idle
+            }           "Waiting for inter-packet gap";
+    tx_fsm_aborting {
+        tx_fsm_skipping
+            }      "Data not valid when required - aborting packet";
+    tx_fsm_skipping {
+        tx_fsm_idle
+            }      "Dropping input data until 'last' asserted";
+} t_tx_fsm;
+
+/*t t_tx_action */
+typedef enum [5] {
+    tx_action_none,
+    tx_action_sop                "Packet data valid, send SOP",
+    tx_action_preamble           "Send preamble",
+    tx_action_preamble_end       "Send last byte of preamble",
+    tx_action_data               "Send next byte of packet data and update FCS",
+    tx_action_last_data_of_word  "Send last byte of current packet data and update FCS - stays in data though",
+    tx_action_data_pad           "Send last byte of packet data and update FCS and start padding",
+    tx_action_pad                "Send padding byte and update FCS",
+    tx_action_pad_eop            "Send last byte of padding and update FCS",
+    tx_action_data_eop           "Send last byte of packet data and update FCS",
+    tx_action_fcs                "Send next byte of FCS",
+    tx_action_fcs_end            "Send last byte of FCS",
+    tx_action_ipg                "Send idle",
+    tx_action_idle               "Start wait for packet data in to be valid",
+    tx_action_abort_start        "Send inverted FCS out",
+    tx_action_abort              "Send inverted FCS out",
+    tx_action_abort_end          "Send inverted FCS out and move to skip",
+    tx_action_drop               "Drop any incoming packet data (will not be last)",
+    tx_action_drop_idle          "Drop last incoming packet data and move to ipg"
+} t_tx_action;
+
+/*t t_fcs_op */
+typedef enum [2] {
+    fcs_op_none    "Do not update the FCS",
+    fcs_op_init    "Initialize the FCS to -1",
+    fcs_op_calc    "Calculate the FCS with the current data byte",
+    fcs_op_shift   "Shift the FCS by one byte"
+} t_fcs_op;
+
+/*t t_tx_combs */
+typedef struct {
+    t_tx_action action;
+    bit consuming_axi4s;
+    bit can_output_symbol;
+    bit last_byte_of_packet "Asserted if AXI4S 'last' and last tx strobe";
+    bit data_invalid        "Asserted if AXI4S data is not ready for state machine";
+    bit padding_required    "Asserted if padding is required to minimum ethernet packet size";
+    bit[8] axi4s_data_byte;
+    bit[8] axi4s_fcs_byte;
+    bit[32] next_fcs;
+    bit shift_data;
+    t_fcs_op fcs_op;
+    bit[16] byte_of_packet_plus_one;
+    t_packet_stat packet_stat  "Packet stat for packet as it is transmitted";
+} t_tx_combs;
+
+/*t t_tx_state */
+typedef struct {
+    t_tx_fsm  fsm_state;
+    bit[4]    count          "State machine counter";
+    t_axi4s32 axi4s          "AXI4S data being consumed";
+    t_axi4s32 pending_axi4s  "AXI4S data waiting to be moved to axi4s";
+    bit[32]   fcs;
+    bit       gmii_tx_valid  "If low, then all GMII TX outputs are low - else to values in gmii_tx";
+    t_gmii_tx gmii_tx        "GMII TX data out (if gmii_tx_valid)";
+    bit[16]   byte_of_packet "Byte of packet";
+    bit[4]    ipg;
+    t_packet_stat packet_stat  "Packet stat for packet as it is transmitted";
+} t_tx_state;
+
+/*t t_rx_fsm */
+typedef fsm {
+    rx_fsm_idle  {
+        rx_fsm_preamble, rx_fsm_wait_for_idle
+            }          "Waiting for valid data in";
+    rx_fsm_preamble  {
+        rx_fsm_data
+            }     "Outputting preamble";
+    rx_fsm_data  {
+        rx_fsm_idle, rx_fsm_wait_for_idle
+            }         "Outputting data, calculating FCS";
+    rx_fsm_wait_for_idle {
+        rx_fsm_idle
+            }  "Waiting for idle from GMII";
+} t_rx_fsm;
+
+/*t t_rx_action
+ *
+ * The action taken by the RX FSM
+ *
+ */
+typedef enum [5] {
+    rx_action_none               "No change to RX FSM",
+    rx_action_sop                "Packet data valid, send SOP",
+    rx_action_preamble_end       "Last byte of preamble seen (0xd5) so move to @a rx_fsm_data",
+    rx_action_data               "Receive a byte of data",
+    rx_action_packet_okay        "GMII is idle after last byte of data, and FCS correct - complete reception",
+    rx_action_packet_error       "Too large an ethernet packet, error without data, or FCS bad on last packet",
+    rx_action_idle               "Return state machine to idle",
+    rx_action_overrun            "Valid byte received but the buffer was full",
+    rx_action_non_packet_error   "Error indication received while packet was not being received (e.g. carrier error)",
+} t_rx_action;
+
+/*t t_rx_combs */
+typedef struct {
+    t_timer_value timer_value             "Timer value from clock_timer, or 0 if disabled";
+    t_rx_action   action                  "Action for RX FSM to perform";
+    bit[8]        gmii_data               "GMII receive data for this cycle";
+    bit           gmii_idle               "Asserted if GMII is idle in this cycle";
+    bit           gmii_valid_data         "Asserted if GMII has valid (non-errored) data in this cycle";
+    bit           gmii_valid              "Asserted if GMII has valid (possibly errored) data in this cycle";
+    bit data_ready_for_axi                "Asserted if the buffer contains four bytes of received data";
+    bit           axi_cannot_take_data    "Asserted if the data buffer is full but the AXI output register cannot take it";
+    bit store_byte                        "Asserted if a received data byte is to be stored in the buffer";
+    bit store_timestamp                   "Asserted if the timestampe should be stored in the user data";
+    bit store_status                      "Asserted if the received packet status is ready and the buffer should have the last AXI transaction";
+    bit[32] status_axi_user               "Status to be stored in the buffer";
+    t_fcs_op fcs_op                       "Operation for FCS calculation for this cycle";
+    bit[32] next_fcs                      "FCS value for next cycle";
+    bit fcs_valid                         "Asserted if the FCS value is 0xdebb20e3, i.e. that expected at the end of a packet";
+    bit[16] byte_of_packet_plus_one       "Increment of current byte of packet";
+    t_packet_stat packet_stat  "Packet stat for packet as it is transmitted";
+} t_rx_combs;
+
+/*t t_rx_state */
+typedef struct {
+    t_axi4s32 axi4s            "AXI4S data being presented";
+    t_rx_fsm  fsm_state        "FSM state";
+    t_packet_stat packet_stat  "Packet stat for packet as it is received";
+    bit[4]    byte_valid       "Bytes valid in data_word";
+    bit[32]   data_word        "Data from packet being assembled for AXI";
+    bit[32]   user             "User value for next AXI word";
+    bit[32]   fcs              "Current FCS value (before any byte in current cycle";
+    bit[16]   byte_of_packet   "Byte of packet";
+    bit[16]   max_mtu          "Largest packet size supported";
+} t_rx_state;
+
+/*a Module
+*/
+/*m gbe_axi4s32 */
+module gbe_axi4s32( clock  tx_aclk   "Transmit clock domain - AXI-4-S and GMII TX clock",
+                    input  bit        tx_areset_n,
+                    input  t_axi4s32  tx_axi4s        "AXI-4-S bus for transmit data",
+                    output bit        tx_axi4s_tready "Tready signal to ack transmit AXI-4-S bus",
+                    input  bit        gmii_tx_enable  "Clock enable for tx_aclk for GMII",
+                    output t_gmii_tx  gmii_tx         "GMII Tx bus (valid only when gmii_tx_enable is asserted)",
+                    output t_packet_stat tx_packet_stat     "Packet statistic when packet completes tx",
+                    input  bit           tx_packet_stat_ack "Ack for packet statistic",
+
+                    clock rx_aclk    "Receive clock domain - AXI-4-S and GMII RX clock",
+                    input bit rx_areset_n,
+                    output t_axi4s32 rx_axi4s,
+                    input  bit        rx_axi4s_tready,
+                    input  bit gmii_rx_enable "Clock enable for rx_aclk for GMII",
+                    input  t_gmii_rx gmii_rx,
+                    output t_packet_stat rx_packet_stat "Packet statistic when packet completes rx",
+                    input  bit           rx_packet_stat_ack "Ack for packet statistic",
+                    
+                    input t_timer_control rx_timer_control "Timer control in RX clock domain - tie all low if no timestamp required"
+    )
+/*b Documentation */
+"""
+A light-weight full-duplex Ethernet MAC supporting GMII.
+
+For the FCS, note that the CRC-32 specification is (CRC>>1) | (CRC[0]?0x04C11DB7:0)
+
+>>> x = bits_of_n(32,0x04C11DB7)
+[1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0]
+>>> x.reverse(); int_of_bits(x)
+0xedb88320 /2= 76dc4190 /2= 3b6e20c8 /2= 1db71064 /2= 0edb8832 /2= 076dc419 (note bit 0 set)
+
+The FCS is initialized to -1 so that the length of the packet is important
+The final FCS transmitted is ~FCS, so that the remainder is expected to be the
+CRC-32 of 0xffffffff = 0xC704DD7B, bit reversed to 0xdebb20e3
+
+"""
+/*b Module body */
+{
+    /*b Tx combs and state */
+    comb     t_tx_combs tx_combs;
+    clocked clock tx_aclk reset active_low tx_areset_n t_tx_state tx_state = {*=0};
+
+    /*b Tx AXI-4S interface */
+    tx_axi4s : {
+        tx_axi4s_tready = 1;
+        if (tx_combs.shift_data) {
+            tx_state.axi4s.t.data[24;0] <= tx_state.axi4s.t.data[24;8];
+            tx_state.axi4s.t.strb <= tx_state.axi4s.t.strb>>1;
+        }
+        if (tx_combs.consuming_axi4s) {
+            tx_state.axi4s.valid <= 0;                
+        }
+        if (tx_state.pending_axi4s.valid) {
+            tx_axi4s_tready = 0;
+            if (!tx_state.axi4s.valid || tx_combs.consuming_axi4s) {
+                tx_state.axi4s               <= tx_state.pending_axi4s;
+                tx_state.pending_axi4s.valid <= 0;                
+            }
+        } elsif (tx_axi4s.valid) {
+            tx_state.pending_axi4s <= tx_axi4s;
+        }
+    }
+
+    /*b Tx state machine */
+    tx_fsm : {
+        /*b Decode AXI state for FSM */
+        tx_combs.data_invalid    = !tx_state.axi4s.valid;
+        tx_combs.last_byte_of_packet = (tx_state.axi4s.t.strb<2) && tx_state.axi4s.t.last;
+        tx_state.ipg <= 12;
+        tx_combs.can_output_symbol = (!tx_state.gmii_tx_valid) || gmii_tx_enable;
+        tx_combs.padding_required = (tx_state.byte_of_packet<59);
+        if (disable_padding) {
+            tx_combs.padding_required = 0;
+        }
+        
+        /*b TX FSM */
+        tx_combs.action = tx_action_none;
+        full_switch (tx_state.fsm_state) {
+        case tx_fsm_idle: {
+            if (tx_state.axi4s.valid && tx_combs.can_output_symbol) {
+                tx_combs.action = tx_action_sop;
+            }
+        }
+        case tx_fsm_preamble: {
+            if (tx_combs.can_output_symbol) {
+                tx_combs.action = tx_action_preamble;
+                if (tx_state.count==0) {
+                    tx_combs.action = tx_action_preamble_end;
+                }
+            }
+        }
+        case tx_fsm_data: {
+            if (tx_combs.can_output_symbol) {
+                tx_combs.action = tx_action_data;
+                if (tx_state.count==0) {
+                    tx_combs.action = tx_action_last_data_of_word;
+                }
+                if (tx_combs.last_byte_of_packet) {
+                    tx_combs.action = tx_action_data_eop;
+                    if (tx_combs.padding_required) {
+                        tx_combs.action = tx_action_data_pad;
+                    }
+                }
+                if (tx_combs.data_invalid) {
+                    tx_combs.action = tx_action_abort_start;
+                }
+            }
+        }
+        case tx_fsm_padding: {
+            if (tx_combs.can_output_symbol) {
+                tx_combs.action = tx_action_pad;
+                if (!tx_combs.padding_required) {
+                    tx_combs.action = tx_action_pad_eop;
+                }
+            }
+        }
+        case tx_fsm_fcs: {
+            if (tx_combs.can_output_symbol) {
+                tx_combs.action = tx_action_fcs;
+                if (tx_state.count==0) {
+                    tx_combs.action = tx_action_fcs_end;
+                }
+            }
+        }
+        case tx_fsm_ipg: {
+            if (tx_combs.can_output_symbol) {
+                tx_combs.action = tx_action_ipg;
+                if (tx_state.count==0) {
+                    tx_combs.action = tx_action_idle;
+                }
+            }
+        }
+        case tx_fsm_aborting: {
+            if (tx_combs.can_output_symbol) {
+                tx_combs.action = tx_action_abort;
+                if (tx_state.count==0) {
+                    tx_combs.action = tx_action_abort_end;
+                }
+            }
+        }
+        case tx_fsm_skipping: {
+            if (tx_state.axi4s.valid) {
+                tx_combs.action = tx_action_drop;
+                if (tx_state.axi4s.t.last) {
+                    tx_combs.action = tx_action_drop_idle;
+                }
+            }
+        }
+        }
+
+        /*b Decode action to state update and other controls
+         */
+        tx_combs.consuming_axi4s = 0;
+        tx_combs.shift_data      = 0;
+        tx_combs.fcs_op          = fcs_op_none;
+        tx_state.count <= tx_state.count - 1;
+        tx_combs.byte_of_packet_plus_one = tx_state.byte_of_packet+1;
+        if (tx_state.byte_of_packet==-1) { // Saturate 
+            tx_combs.byte_of_packet_plus_one = -1;
+        }
+
+        tx_combs.axi4s_data_byte = tx_state.axi4s.t.data[8;0];
+        tx_combs.axi4s_data_byte = tx_state.axi4s.t.data[8;0];
+        tx_combs.axi4s_fcs_byte  = ~tx_state.fcs[8;0]; 
+        if (gmii_tx_enable) {
+            tx_state.gmii_tx_valid <= 0;
+        }
+
+        tx_combs.packet_stat = {*=0};
+        tx_combs.packet_stat.byte_count = tx_state.byte_of_packet;
+        
+        full_switch (tx_combs.action) {
+        case tx_action_none: {
+            tx_state.fsm_state <= tx_state.fsm_state;
+            tx_state.count     <= tx_state.count;
+        }
+        case tx_action_sop: {
+            tx_state.fsm_state <= tx_fsm_preamble;
+            tx_state.gmii_tx_valid <= 1;
+            tx_state.gmii_tx.tx_en <= 1;
+            tx_state.gmii_tx.tx_er <= 0;
+            tx_state.gmii_tx.txd   <= 0x55;
+            tx_state.count         <= preamble_length-2; // Since SOP is one, and last preamble byte is different
+            tx_state.byte_of_packet <= 0;
+            tx_combs.fcs_op         = fcs_op_init;
+        }
+        case tx_action_preamble: {
+            tx_state.gmii_tx_valid <= 1;
+        }
+        case tx_action_preamble_end: {
+            tx_state.fsm_state <= tx_fsm_data;
+            tx_state.gmii_tx_valid <= 1;
+            tx_state.gmii_tx.txd   <= 0xd5;
+            tx_state.count         <= 3;
+        }
+        case tx_action_data: {
+            tx_state.gmii_tx_valid <= 1;
+            tx_state.gmii_tx.txd   <= tx_combs.axi4s_data_byte;
+            tx_state.byte_of_packet <= tx_combs.byte_of_packet_plus_one;
+            tx_combs.shift_data    = 1;
+            tx_combs.fcs_op        = fcs_op_calc;
+        }
+        case tx_action_last_data_of_word: {
+            tx_state.gmii_tx_valid <= 1;
+            tx_state.gmii_tx.txd   <= tx_combs.axi4s_data_byte;
+            tx_state.count         <= 3;
+            tx_state.byte_of_packet <= tx_combs.byte_of_packet_plus_one;
+            tx_combs.fcs_op        = fcs_op_calc;
+            tx_combs.consuming_axi4s = 1;
+        }
+        case tx_action_data_eop: {
+            tx_state.fsm_state <= tx_fsm_fcs;
+            tx_state.gmii_tx_valid <= 1;
+            tx_state.gmii_tx.txd   <= tx_combs.axi4s_data_byte;
+            tx_state.byte_of_packet <= tx_combs.byte_of_packet_plus_one;
+            tx_state.count         <= 3;
+            tx_combs.fcs_op        = fcs_op_calc;
+            tx_combs.consuming_axi4s = 1;
+        }
+        case tx_action_data_pad: { // Send last byte of packet data and update FCS and start padding
+            tx_state.fsm_state       <= tx_fsm_padding;
+            tx_state.gmii_tx_valid   <= 1;
+            tx_state.gmii_tx.txd     <= tx_combs.axi4s_data_byte;
+            tx_state.byte_of_packet  <= tx_combs.byte_of_packet_plus_one;
+            tx_combs.fcs_op          = fcs_op_calc;
+            tx_combs.consuming_axi4s = 1;
+        }
+        case tx_action_pad: { // Send padding byte and update FCS
+            tx_state.fsm_state       <= tx_fsm_padding;
+            tx_state.gmii_tx_valid   <= 1;
+            tx_state.gmii_tx.txd     <= 0;
+            tx_state.byte_of_packet  <= tx_combs.byte_of_packet_plus_one;
+            tx_combs.fcs_op          = fcs_op_calc;
+        }
+        case tx_action_pad_eop: { // Send last byte of padding (byte 60 of packet) and update FCS
+            tx_state.fsm_state <= tx_fsm_fcs;
+            tx_state.gmii_tx_valid  <= 1;
+            tx_state.gmii_tx.txd    <= 0;
+            tx_state.byte_of_packet <= tx_combs.byte_of_packet_plus_one;
+            tx_state.count          <= 3;
+            tx_combs.fcs_op         = fcs_op_calc;
+        }
+        case tx_action_fcs: {
+            tx_state.gmii_tx_valid <= 1;
+            tx_state.gmii_tx.txd   <= tx_combs.axi4s_fcs_byte;
+            tx_combs.fcs_op        = fcs_op_shift;
+        }
+        case tx_action_fcs_end: {
+            tx_state.fsm_state     <= tx_fsm_ipg;
+            tx_state.gmii_tx_valid <= 1;
+            tx_state.gmii_tx.txd   <= tx_combs.axi4s_fcs_byte;
+            tx_state.count         <= tx_state.ipg;
+            tx_combs.packet_stat.valid = 1;
+            tx_combs.packet_stat.stat_type = packet_stat_type_okay;
+        }
+        case tx_action_ipg: {
+            tx_state.fsm_state     <= tx_fsm_ipg;
+            tx_state.gmii_tx_valid <= 0;
+        }
+        case tx_action_idle: {
+            tx_state.fsm_state     <= tx_fsm_idle;
+            tx_state.gmii_tx_valid <= 0;
+        }
+        case tx_action_abort_start: {
+            tx_state.fsm_state <= tx_fsm_aborting;
+            tx_state.count         <= 3;
+            tx_state.gmii_tx_valid <= 1;
+            tx_state.gmii_tx.txd   <= ~tx_combs.axi4s_fcs_byte;
+            tx_combs.packet_stat.valid = 1;
+            tx_combs.packet_stat.stat_type = packet_stat_type_underrun;
+        }
+        case tx_action_abort: {
+            tx_state.gmii_tx_valid <= 1;
+            tx_state.gmii_tx.txd   <= ~tx_combs.axi4s_fcs_byte;
+        }
+        case tx_action_abort_end: {
+            tx_state.fsm_state <= tx_fsm_skipping;
+            tx_state.gmii_tx_valid <= 1;
+            tx_state.gmii_tx.txd   <= ~tx_combs.axi4s_fcs_byte;
+        }
+        case tx_action_drop: {
+            tx_state.gmii_tx_valid <= 0;
+            tx_combs.consuming_axi4s = 1;
+        }
+        case tx_action_drop_idle: {
+            tx_state.fsm_state <= tx_fsm_ipg;
+            tx_state.gmii_tx_valid <= 0;
+            tx_combs.consuming_axi4s = 1;
+        }
+        }
+
+        /*b GMII TX output */
+        gmii_tx = {*=0};
+        if (tx_state.gmii_tx_valid) {
+            gmii_tx = tx_state.gmii_tx;
+        }
+
+        /*b TX packet stat */
+        if (tx_state.packet_stat.valid && tx_packet_stat_ack) {
+            tx_state.packet_stat.valid <= 0;
+        }
+        if (tx_combs.packet_stat.valid) {
+            tx_state.packet_stat <= tx_combs.packet_stat;
+        }
+        tx_packet_stat = tx_state.packet_stat;
+
+        /*b All done */
+    }        
+
+    /*b Tx FCS */
+    tx_fcs:{
+        tx_combs.next_fcs = tx_state.fcs >> 8;
+        if (tx_state.fcs[7] ^ tx_combs.axi4s_data_byte[7]) { tx_combs.next_fcs = tx_combs.next_fcs ^ 32hedb88320; }
+        if (tx_state.fcs[6] ^ tx_combs.axi4s_data_byte[6]) { tx_combs.next_fcs = tx_combs.next_fcs ^ 32h76dc4190; }
+        if (tx_state.fcs[5] ^ tx_combs.axi4s_data_byte[5]) { tx_combs.next_fcs = tx_combs.next_fcs ^ 32h3b6e20c8; }
+        if (tx_state.fcs[4] ^ tx_combs.axi4s_data_byte[4]) { tx_combs.next_fcs = tx_combs.next_fcs ^ 32h1db71064; }
+        if (tx_state.fcs[3] ^ tx_combs.axi4s_data_byte[3]) { tx_combs.next_fcs = tx_combs.next_fcs ^ 32h0edb8832; }
+        if (tx_state.fcs[2] ^ tx_combs.axi4s_data_byte[2]) { tx_combs.next_fcs = tx_combs.next_fcs ^ 32h076dc419; }
+        if (tx_state.fcs[1] ^ tx_combs.axi4s_data_byte[1]) { tx_combs.next_fcs = tx_combs.next_fcs ^ 32hee0e612c; }
+        if (tx_state.fcs[0] ^ tx_combs.axi4s_data_byte[0]) { tx_combs.next_fcs = tx_combs.next_fcs ^ 32h77073096; }
+
+        full_switch (tx_combs.fcs_op) {
+        case fcs_op_init:  { tx_state.fcs <= -1; }
+        case fcs_op_calc:  { tx_state.fcs <= tx_combs.next_fcs; }
+        case fcs_op_shift: { tx_state.fcs[24;0] <= tx_state.fcs[24;8]; }
+        default:           { tx_state.fcs <= tx_state.fcs; }
+        }
+    }
+
+    /*b Rx timer instantiations */
+    net t_timer_value rx_timer_value;
+    rx_timer: {
+        clock_timer rx_ckt( clk <- rx_aclk,
+                            reset_n <= rx_areset_n,
+                            timer_control <= rx_timer_control,
+                            timer_value   => rx_timer_value
+            );
+        rx_combs.timer_value = rx_timer_value;
+        if (disable_rx_timer) {
+            rx_combs.timer_value = {*=0};
+        }
+    }
+
+    /*b Rx combs and state */
+    comb     t_rx_combs rx_combs;
+    clocked clock rx_aclk reset active_low rx_areset_n t_rx_state rx_state = {*=0};
+    /*b Rx state machine */
+    rx_fsm : {
+        /*b Decode AXI state for FSM */
+        rx_combs.gmii_data       = gmii_rx.rxd;
+        rx_combs.gmii_idle       = gmii_rx_enable && !gmii_rx.rx_dv && !gmii_rx.rx_er;
+        rx_combs.gmii_valid_data = gmii_rx_enable && gmii_rx.rx_dv && !gmii_rx.rx_er;
+        rx_combs.gmii_valid      = gmii_rx_enable;
+
+        rx_combs.data_ready_for_axi = 0;
+        rx_combs.axi_cannot_take_data = 0;
+        if ((rx_state.byte_of_packet[2;0]==0) && rx_state.byte_valid[0]) {
+            rx_combs.data_ready_for_axi = 1;
+        }
+        if (rx_combs.data_ready_for_axi && rx_state.axi4s.valid) {
+            rx_combs.axi_cannot_take_data = 1;
+        }
+        
+        /*b RX FSM */
+        rx_combs.action = rx_action_none;
+        full_switch (rx_state.fsm_state) {
+        case rx_fsm_idle: {
+            if (rx_combs.gmii_valid_data && (rx_combs.gmii_data==0x55)) {
+                rx_combs.action = rx_action_sop;
+            } elsif (rx_combs.gmii_valid && !rx_combs.gmii_idle) {
+                rx_combs.action = rx_action_non_packet_error;
+            }
+        }
+        case rx_fsm_preamble: {
+            if (rx_combs.gmii_valid_data && (rx_combs.gmii_data==0x55)) {
+                rx_combs.action = rx_action_sop;
+            } elsif (rx_combs.gmii_valid_data && (rx_combs.gmii_data==0xd5)) {
+                rx_combs.action = rx_action_preamble_end;
+                if (rx_combs.axi_cannot_take_data) {
+                    rx_combs.action = rx_action_overrun;
+                }
+            } elsif (rx_combs.gmii_valid) {
+                rx_combs.action = rx_action_non_packet_error;
+            }
+        }
+        case rx_fsm_data: {
+            if (rx_combs.gmii_valid_data) { // rv_dv and not rv_er
+                rx_combs.action = rx_action_data;
+                if (rx_combs.axi_cannot_take_data) {
+                    rx_combs.action = rx_action_overrun;
+                }
+                if (rx_state.byte_of_packet > rx_state.max_mtu) {
+                    rx_combs.action = rx_action_packet_error;
+                }
+            } elsif (rx_combs.gmii_idle) { // not rx_dv and not rx_er
+                rx_combs.action = rx_action_packet_okay; // done without needing more data
+                if (!rx_combs.fcs_valid) {
+                    rx_combs.action = rx_action_packet_error;
+                }
+            } elsif (rx_combs.gmii_valid) { // rx_er
+                rx_combs.action = rx_action_packet_error;
+            }
+        }
+        case rx_fsm_wait_for_idle: {
+            if (rx_combs.gmii_idle) {
+                rx_combs.action = rx_action_idle;
+            }
+        }
+        }
+
+        /*b Decode action to state update and other controls
+         */
+        rx_combs.fcs_op          = fcs_op_none;
+        rx_combs.byte_of_packet_plus_one = rx_state.byte_of_packet+1;
+        rx_combs.store_byte       = 0;
+        rx_combs.store_timestamp  = 0;
+        rx_combs.store_status     = 0;
+        rx_combs.status_axi_user  = 0;
+        rx_combs.status_axi_user[8;0]  = axi4s_user_rx_complete;
+        rx_combs.status_axi_user[16;8] = rx_state.byte_of_packet;
+
+        rx_combs.packet_stat = {*=0};
+        rx_combs.packet_stat.byte_count = rx_state.byte_of_packet;
+        
+        full_switch (rx_combs.action) {
+        case rx_action_none: {
+            rx_state.fsm_state <= rx_state.fsm_state;
+        }
+        case rx_action_sop: {
+            rx_state.fsm_state <= rx_fsm_preamble;
+            rx_state.byte_of_packet <= 0;
+        }
+        case rx_action_preamble_end: {
+            rx_state.fsm_state        <= rx_fsm_data;
+            rx_state.byte_of_packet   <= 0;
+            rx_combs.store_timestamp  = 1;
+            rx_combs.fcs_op           = fcs_op_init;
+        }
+        case rx_action_data: {
+            rx_state.byte_of_packet <= rx_combs.byte_of_packet_plus_one;
+            rx_combs.store_byte    = 1;
+            rx_combs.fcs_op        = fcs_op_calc;
+        }
+        case rx_action_packet_okay: { // Packet completed
+            rx_state.fsm_state   <= rx_fsm_idle;
+            rx_combs.store_status  = 1;
+            rx_combs.packet_stat.valid = 1;
+            rx_combs.packet_stat.stat_type = packet_stat_type_okay;
+        }
+        case rx_action_packet_error: { // Packet error - too big, bad FCS, rx_er
+            rx_state.fsm_state   <= rx_fsm_wait_for_idle;
+            rx_combs.store_status  = 1;
+            rx_combs.status_axi_user[8;0]  = axi4s_user_rx_error;
+            rx_combs.packet_stat.valid = 1;
+            rx_combs.packet_stat.stat_type = packet_stat_type_data_error; // should separate out overrun?
+        }
+        case rx_action_non_packet_error: { // Packet completed
+            rx_state.fsm_state   <= rx_fsm_wait_for_idle;
+        }
+        case rx_action_overrun: { // Data overrun - cannot store a byte when we need to
+            rx_combs.store_status  = 1;
+            rx_state.fsm_state   <= rx_fsm_wait_for_idle;
+        }
+        case rx_action_idle: { // Packet completed
+            rx_state.fsm_state   <= rx_fsm_idle;
+        }
+        }
+
+        /*b Store data */
+        if (rx_state.axi4s.valid && rx_axi4s_tready) {
+            rx_state.axi4s.valid <= 0;            
+        }
+        
+        if ((rx_combs.store_byte && rx_combs.data_ready_for_axi) ||
+            rx_combs.store_status) { // store_status may be asserted for errors even if AXI is already valid
+            rx_state.axi4s.valid  <= 1;
+            rx_state.axi4s.t <= {*=0};
+            rx_state.axi4s.t.data <= rx_state.data_word;
+            rx_state.axi4s.t.strb <= rx_state.byte_valid;
+            rx_state.axi4s.t.user[32;0] <= rx_state.user;
+            rx_state.axi4s.t.last <= 0;
+            if (rx_combs.store_status) {
+                rx_state.axi4s.t.user[32;0] <= rx_combs.status_axi_user;
+                rx_state.axi4s.t.last <= 1;
+            }
+            rx_state.byte_valid <= 0;
+            rx_state.user       <= 0;
+        }
+        if (rx_combs.store_timestamp && !disable_rx_timer) {
+            rx_state.user[24;8] <= rx_combs.timer_value.value[24;0];
+            rx_state.user[ 8;0] <= axi4s_user_timestamp;
+        }
+        if (rx_combs.store_byte) {
+            full_switch (rx_state.byte_of_packet[2;0]) {
+            case 0: {
+                rx_state.data_word[8; 0] <= rx_combs.gmii_data;
+                rx_state.byte_valid[0]   <= 1;
+            }
+            case 1: {
+                rx_state.data_word[8; 8] <= rx_combs.gmii_data;
+                rx_state.byte_valid[1]   <= 1;
+            }
+            case 2: {
+                rx_state.data_word[8;16] <= rx_combs.gmii_data;
+                rx_state.byte_valid[2]   <= 1;
+            }
+            case 3: {
+                rx_state.data_word[8;24] <= rx_combs.gmii_data;
+                rx_state.byte_valid[3]   <= 1;
+            }
+            }
+        }
+        
+        /*b GMII RX output */
+        rx_axi4s = rx_state.axi4s;
+
+        /*b RX packet stat */
+        if (rx_state.packet_stat.valid && rx_packet_stat_ack) {
+            rx_state.packet_stat.valid <= 0;
+        }
+        if (rx_combs.packet_stat.valid) {
+            rx_state.packet_stat <= rx_combs.packet_stat;
+        }
+        
+        rx_packet_stat = rx_state.packet_stat;
+    }        
+
+    /*b Rx FCS */
+    rx_fcs:{
+        rx_combs.next_fcs = rx_state.fcs >> 8;
+        if (rx_state.fcs[7] ^ rx_combs.gmii_data[7]) { rx_combs.next_fcs = rx_combs.next_fcs ^ 32hedb88320; }
+        if (rx_state.fcs[6] ^ rx_combs.gmii_data[6]) { rx_combs.next_fcs = rx_combs.next_fcs ^ 32h76dc4190; }
+        if (rx_state.fcs[5] ^ rx_combs.gmii_data[5]) { rx_combs.next_fcs = rx_combs.next_fcs ^ 32h3b6e20c8; }
+        if (rx_state.fcs[4] ^ rx_combs.gmii_data[4]) { rx_combs.next_fcs = rx_combs.next_fcs ^ 32h1db71064; }
+        if (rx_state.fcs[3] ^ rx_combs.gmii_data[3]) { rx_combs.next_fcs = rx_combs.next_fcs ^ 32h0edb8832; }
+        if (rx_state.fcs[2] ^ rx_combs.gmii_data[2]) { rx_combs.next_fcs = rx_combs.next_fcs ^ 32h076dc419; }
+        if (rx_state.fcs[1] ^ rx_combs.gmii_data[1]) { rx_combs.next_fcs = rx_combs.next_fcs ^ 32hee0e612c; }
+        if (rx_state.fcs[0] ^ rx_combs.gmii_data[0]) { rx_combs.next_fcs = rx_combs.next_fcs ^ 32h77073096; }
+
+        full_switch (rx_combs.fcs_op) {
+        case fcs_op_init:  { rx_state.fcs <= -1; }
+        case fcs_op_calc:  { rx_state.fcs <= rx_combs.next_fcs; }
+        default:           { rx_state.fcs <= rx_state.fcs; }
+        }
+        rx_combs.fcs_valid = (rx_state.fcs==0xdebb20e3); // reverse of 0xC704DD7B 
+        rx_state.max_mtu <= -1;
+    }
+
+    /*b All done */
+}
+
