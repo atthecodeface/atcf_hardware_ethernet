@@ -16,10 +16,10 @@
  *
  */
 /*a Includes */
-include "types/ethernet.h"
-include "types/encoding.h"
-include "networking/gmii_modules.h"
-include "networking/encoders.h"
+include "ethernet.h"
+include "encoding.h"
+include "gmii_modules.h"
+include "encoders.h"
 
 /*a External modules */
 extern module se_test_harness( clock clk,

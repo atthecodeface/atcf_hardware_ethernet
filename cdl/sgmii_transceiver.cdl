@@ -17,11 +17,12 @@
  */
 /*a Includes */
 include "std::tech_sync.h"
-include "io.h"
+include "std::io.h"
+include "std::bit_delay.h"
 include "clocking::clocking.h"
 include "clocking::clocking_modules.h"
 include "ethernet.h"
-include "technology/serdes_modules.h"
+include "std::tech_serdes.h"
 
 /*a Constants
 */

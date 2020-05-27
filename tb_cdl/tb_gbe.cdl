@@ -16,9 +16,9 @@
  *
  */
 /*a Includes */
-include "types/ethernet.h"
-include "networking/ethernet_modules.h"
-include "networking/gmii_modules.h"
+include "ethernet.h"
+include "ethernet_modules.h"
+include "gmii_modules.h"
 
 /*a External modules */
 extern module axi4s32_master_slave( clock aclk,

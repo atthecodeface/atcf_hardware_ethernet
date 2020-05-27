@@ -16,8 +16,8 @@
  *
  */
 /*a Includes */
-include "types/encoding.h"
-include "networking/encoders.h"
+include "encoding.h"
+include "encoders.h"
 
 /*a External modules */
 extern module se_test_harness( clock clk,
