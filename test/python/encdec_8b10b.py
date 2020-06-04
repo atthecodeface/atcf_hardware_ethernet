@@ -1,8 +1,8 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 def count_ones(n, sum=0):
     if n==0: return sum
-    if n&1: return count_ones(n/2,sum+1)
-    return count_ones(n/2,sum)
+    if n&1: return count_ones(n//2,sum+1)
+    return count_ones(n//2,sum)
 
 class encoding:
     encoded_bits = 6
@@ -195,7 +195,7 @@ def enc_pair_str(ep):
            
         
 #a Toplevel
-control_symbols = [a+32*b for (a,b) in (23,7),(27,7),(29,7),(30,7), (28,0),(28,1),(28,2),(28,3),(28,4),(28,5),(28,6),(28,7)]
+control_symbols = [a+32*b for (a,b) in [(23,7),(27,7),(29,7),(30,7), (28,0),(28,1),(28,2),(28,3),(28,4),(28,5),(28,6),(28,7)]]
 data_symbols = range(256)
 encodings_8b10b = []
 for d in control_symbols:
@@ -208,12 +208,12 @@ for d in data_symbols:
     pass
 if __name__ == '__main__':
     for e in encodings_8b10b:
-        print str(e)
+        print(str(e))
         pass
     for i in range(1024):
         for d in range(2):
             e = find_encoding(encodings_8b10b, {"encoding":i, "disparity_in":d})
-            print i,d,str(e)
+            print(i,d,str(e))
             pass
         pass
     pass

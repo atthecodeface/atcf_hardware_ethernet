@@ -21,5 +21,6 @@ class GbEModules(cdl_desc.Modules):
     modules += [ CdlModule("sgmii_transceiver") ]
     modules += [ CdlModule("tb_sgmii", src_dir=tb_src_dir) ]
     modules += [ CdlModule("tb_gbe", src_dir=tb_src_dir) ]
+    modules += [ CdlModule("tb_8b10b", src_dir=tb_src_dir) ]
     pass
 

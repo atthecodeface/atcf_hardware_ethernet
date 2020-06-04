@@ -264,7 +264,8 @@ typedef enum [5] {
     gmii_rx_action_early_extend_carrier,
     gmii_rx_action_extend_error,
     gmii_rx_action_false_carrier_detect,
-    gmii_rx_action_lose_sync
+    gmii_rx_action_lose_sync,
+    gmii_rx_action_count_errors_for_resync "Increment error count; if it gets large enough, resync"
 } t_gmii_rx_action;
 
 /*t t_sgmii_rx_state */
@@ -278,7 +279,8 @@ typedef struct {
 typedef struct {
     bit[10] selected_serial_data;
     bit[10] comma_found      "Asserted if a comma is found at starting a bit position";
-    bit[10] selected_symbol  "Symbol selected from serial_data";
+    bit[10] selected_symbol  "Symbol selected from serial_data, or from tbi_rx";
+    bit     symbol_valid     "Asserted if the selected_symbol is valid";
     bit     seeking_comma    "Asserted if seeking comma sequence";
     bit     loss_of_sync     "Asserted if synchronization lost and comma sequence must be found again";
     t_8b10b_symbol symbol_to_decode;
@@ -303,6 +305,7 @@ typedef struct {
     bit rx_even            "Cleared on entry to fsm_k, toggled on every symbol";
     t_gmii_rx gmii_rx;
     bit       gmii_rx_enable;
+    bit[8] error_count "Error count that increments on bad data; if it gets large enough, resync; reduce if we are happy";
     // for autonegotiation in RX clock domain
     bit[16] rx_config_data        "Configuration data from the PHY";
     bit[6]  rx_config_data_match  "Shift register with all bits set if 3 consecutive cfg have produced the same cfg data";
@@ -589,7 +592,7 @@ if (request) {
                 gmii_tx_combs.gmii_op = gmii_op_transmit_error;
             }
         } elsif (gmii_tx_state.gmii_tx.tx_er) { // not tx_en & tx_er => decode data
-            gmii_tx_combs.gmii_op = gmii_op_idle;
+            gmii_tx_combs.gmii_op = gmii_op_transmit_error;
             part_switch (gmii_tx_state.gmii_tx.txd) {
             case 0x0f: {gmii_tx_combs.gmii_op = gmii_op_carrier_extend;}
             // case 0x01: {gmii_tx_combs.gmii_op = gmii_op_low_power_idle;}
@@ -646,6 +649,15 @@ if (request) {
         }
         case gmii_tx_fsm_first_carrier: { // send R
             gmii_tx_combs.action = gmii_tx_action_carrier; // Send R
+            // GJS June 2020
+            if (!gmii_tx_state.tx_even) {
+                gmii_tx_combs.action = gmii_tx_action_carrier_idle; // Send R and go to idle (where it will send K)
+            }
+            part_switch (gmii_tx_combs.gmii_op) {
+            case gmii_op_data:           { gmii_tx_combs.action = gmii_tx_action_sop_data;  } // Send S then data
+            case gmii_op_transmit_error: { gmii_tx_combs.action = gmii_tx_action_sop_error; } // Send S then V
+            case gmii_op_carrier_extend: { gmii_tx_combs.action = gmii_tx_action_carrier;   } // Send R and come back
+            }
         }
         case gmii_tx_fsm_finish_carrier: { // send second R or S, may need to send one more R before idle
             gmii_tx_combs.action = gmii_tx_action_carrier; // Send R and come back (unless S!)
@@ -798,6 +810,15 @@ if (request) {
     default reset active_low tx_reset_n;
     tx_gmii_logging:{
         if (gmii_tx_combs.will_take_symbol && gmii_tx_combs.tx_symbol_valid) {
+            if ( (gmii_tx_combs.action!=gmii_tx_action_idle) &&
+                 (gmii_tx_combs.action!=gmii_tx_action_k28_5) ) {
+                log("GMII_tx",
+                    "is_control",gmii_tx_combs.enc_data.is_control,
+                    "data",gmii_tx_combs.enc_data.data,
+                    "disparity",gmii_tx_combs.enc_data.disparity,
+                    "tx_even",gmii_tx_state.tx_even
+                    );
+            }
             if (gmii_tx_combs.enc_data.is_control) {
                 log("GMII tx control",
                     "symbol",gmii_tx_combs.enc_data.data,
@@ -1066,6 +1087,11 @@ if (request) {
                 gmii_rx_combs.selected_symbol |= gmii_rx_state.serial_data[10;i];
             }
         }
+        gmii_rx_combs.symbol_valid = gmii_rx_state.serial_data_valid;
+        if (1) {
+            gmii_rx_combs.selected_symbol = tbi_rx.data;
+            gmii_rx_combs.symbol_valid = tbi_rx.valid;
+        }
 
         /*b Decode received symbol to code group (d/k + data + err) */
         gmii_rx_combs.symbol_to_decode.disparity_positive = gmii_rx_state.disparity;
@@ -1095,12 +1121,15 @@ if (request) {
             if (gmii_rx_combs.comma_found!=0) { // only asserted if data is valid
                 gmii_rx_combs.action = gmii_rx_action_comma_found;
             }
+            if (1) { // use tbi_rx
+                gmii_rx_combs.action = gmii_rx_action_comma_found;
+            }
         }
         case gmii_rx_fsm_wait_for_k: {
-            if (gmii_rx_combs.symbol_is_K && gmii_rx_state.rx_even) {
+            if (gmii_rx_combs.symbol_is_K) {
                 gmii_rx_combs.action = gmii_rx_action_idle_k;
             }
-            if (!gmii_rx_state.serial_data_valid) {
+            if (!gmii_rx_combs.symbol_valid) {
                 gmii_rx_combs.action = gmii_rx_action_none;
             }
         }
@@ -1120,7 +1149,7 @@ if (request) {
                 }
                 }
             }
-            if (!gmii_rx_state.serial_data_valid) {
+            if (!gmii_rx_combs.symbol_valid) {
                 gmii_rx_combs.action = gmii_rx_action_none;
             }
         }
@@ -1131,7 +1160,7 @@ if (request) {
                     gmii_rx_combs.action = gmii_rx_action_idle_k; // in sync
                 }
             }
-            if (!gmii_rx_state.serial_data_valid) {
+            if (!gmii_rx_combs.symbol_valid) {
                 gmii_rx_combs.action = gmii_rx_action_none;
             }
         }
@@ -1140,7 +1169,7 @@ if (request) {
             if (gmii_rx_decoded_symbol.is_control) {
                 gmii_rx_combs.action = gmii_rx_action_invalid;
             }
-            if (!gmii_rx_state.serial_data_valid) {
+            if (!gmii_rx_combs.symbol_valid) {
                 gmii_rx_combs.action = gmii_rx_action_none;
             }
         }
@@ -1149,7 +1178,7 @@ if (request) {
             if (gmii_rx_decoded_symbol.is_control) {
                 gmii_rx_combs.action = gmii_rx_action_invalid;
             }
-            if (!gmii_rx_state.serial_data_valid) {
+            if (!gmii_rx_combs.symbol_valid) {
                 gmii_rx_combs.action = gmii_rx_action_none;
             }
         }
@@ -1158,7 +1187,7 @@ if (request) {
             if (!gmii_rx_combs.symbol_is_K) {
                 gmii_rx_combs.action = gmii_rx_action_invalid;
             }
-            if (!gmii_rx_state.serial_data_valid) {
+            if (!gmii_rx_combs.symbol_valid) {
                 gmii_rx_combs.action = gmii_rx_action_none;
             }
         }
@@ -1177,15 +1206,16 @@ if (request) {
                     gmii_rx_combs.action = gmii_rx_action_invalid;
                 }
             }
-            if (!gmii_rx_state.serial_data_valid) {
+            if (!gmii_rx_combs.symbol_valid) {
                 gmii_rx_combs.action = gmii_rx_action_none;
             }
         }
         case gmii_rx_fsm_false_carrier: { // Wait for K28.5 on even boundary - to get out of this otherwise requires loss of sync
+            gmii_rx_combs.action = gmii_rx_action_count_errors_for_resync;
             if (gmii_rx_combs.symbol_is_K && gmii_rx_state.rx_even) {
                 gmii_rx_combs.action = gmii_rx_action_idle_k;
             }
-            if (!gmii_rx_state.serial_data_valid) {
+            if (!gmii_rx_combs.symbol_valid) {
                 gmii_rx_combs.action = gmii_rx_action_none;
             }
         }
@@ -1200,7 +1230,7 @@ if (request) {
             } elsif (gmii_rx_combs.symbol_is_K) { // Early end
                 gmii_rx_combs.action = gmii_rx_action_early_end; // rx_er and go back to idle_k
             }
-            if (!gmii_rx_state.serial_data_valid) {
+            if (!gmii_rx_combs.symbol_valid) {
                 gmii_rx_combs.action = gmii_rx_action_none;
             }
         }
@@ -1209,7 +1239,7 @@ if (request) {
             if (gmii_rx_combs.symbol_is_R) {
                 gmii_rx_combs.action = gmii_rx_action_extend_carrier; // extend carrier
             }
-            if (!gmii_rx_state.serial_data_valid) {
+            if (!gmii_rx_combs.symbol_valid) {
                 gmii_rx_combs.action = gmii_rx_action_none;
             }
         }
@@ -1222,7 +1252,7 @@ if (request) {
             } elsif (gmii_rx_combs.symbol_is_K && gmii_rx_state.rx_even) { // good end - go back to idle_k
                 gmii_rx_combs.action = gmii_rx_action_idle_k;
             }
-            if (!gmii_rx_state.serial_data_valid) {
+            if (!gmii_rx_combs.symbol_valid) {
                 gmii_rx_combs.action = gmii_rx_action_none;
             }
         }
@@ -1235,7 +1265,7 @@ if (request) {
         }
 
         /*b Decode action */
-        if (gmii_rx_state.serial_data_valid) {
+        if (gmii_rx_combs.symbol_valid) {
             gmii_rx_state.rx_even   <= !gmii_rx_state.rx_even;
             gmii_rx_state.disparity <= gmii_rx_decoded_symbol.disparity_positive;
         }
@@ -1250,11 +1280,11 @@ if (request) {
             gmii_rx_state.gmii_rx.rx_dv <= 0;
         }
         case gmii_rx_action_comma_found: {
-            gmii_rx_state.fsm_state <= gmii_rx_fsm_k;
-            gmii_rx_state.rx_even   <= 0;
+            gmii_rx_state.fsm_state <= gmii_rx_fsm_wait_for_k;
             gmii_rx_state.disparity <= 1; // After a K28.5 disparity toggles - and it should generally be -ve when comma starts
         }
         case gmii_rx_action_idle_k: { // from cfg_d, idle_d, false_carrier, extend_carrier - may be start of cfg or idle or...
+            gmii_rx_state.rx_even   <= 0;
             gmii_rx_state.fsm_state <= gmii_rx_fsm_k;
             gmii_rx_state.gmii_rx.rx_er <= 0;
             gmii_rx_state.gmii_rx.rx_dv <= 0;
@@ -1295,12 +1325,21 @@ if (request) {
         }
         case gmii_rx_action_carrier_detect: { // from extend_carrier and idle_d
             gmii_rx_state.fsm_state <= gmii_rx_fsm_receive;
-            gmii_rx_state.gmii_rx.rx_dv <= 1;
-            gmii_rx_state.gmii_rx.rxd <= 0x55;
+            gmii_rx_state.gmii_rx.rx_er <= 0;
+            if (gmii_rx_state.fsm_state==gmii_rx_fsm_idle_d) {
+                gmii_rx_state.gmii_rx.rx_dv <= 1;
+                gmii_rx_state.gmii_rx.rxd <= 0x55;
+            } else {
+                gmii_rx_state.gmii_rx.rx_er <= 1;
+                gmii_rx_state.gmii_rx.rx_dv <= 0;
+                gmii_rx_state.gmii_rx.rxd   <= 0x0f;
+            }
         }
         case gmii_rx_action_data: { // from extend_carrier and idle_d
             gmii_rx_state.fsm_state <= gmii_rx_fsm_receive;
             gmii_rx_state.gmii_rx.rxd <= gmii_rx_decoded_symbol.data;
+            gmii_rx_state.gmii_rx.rx_dv <= 1;
+            gmii_rx_state.gmii_rx.rx_er <= 0;
         }
         case gmii_rx_action_data_error: { // from receive - set error and stay in receive
             gmii_rx_state.fsm_state <= gmii_rx_fsm_receive;
@@ -1309,9 +1348,15 @@ if (request) {
         case gmii_rx_action_eop: { // from receive - pull rx_dv_low
             gmii_rx_state.fsm_state <= gmii_rx_fsm_eop;
             gmii_rx_state.gmii_rx.rx_dv <= 0;
+            gmii_rx_state.gmii_rx.rx_er <= 0;
         }
         case gmii_rx_action_extend_carrier: { // from eop and extend_carrier
             gmii_rx_state.fsm_state <= gmii_rx_fsm_extend_carrier;
+            if ((gmii_rx_state.fsm_state==gmii_rx_fsm_extend_carrier) && gmii_rx_state.rx_even) {
+                gmii_rx_state.gmii_rx.rx_er <= 1;
+                gmii_rx_state.gmii_rx.rx_dv <= 0;
+                gmii_rx_state.gmii_rx.rxd   <= 0x0f;
+            }
         }
         case gmii_rx_action_early_end: { // from receive - early K or other symbol, so packet is errored
             gmii_rx_state.gmii_rx.rx_er <= 1;
@@ -1323,6 +1368,7 @@ if (request) {
         }
         case gmii_rx_action_extend_error: { // from extend_carrier when not R, S nor even K
             gmii_rx_state.fsm_state <= gmii_rx_fsm_extend_carrier;
+            gmii_rx_state.gmii_rx.rx_dv <= 0;
             gmii_rx_state.gmii_rx.rx_er <= 1;
             gmii_rx_state.gmii_rx.rxd <= 0x1f;
         }
@@ -1331,6 +1377,12 @@ if (request) {
             gmii_rx_state.gmii_rx.rx_er <= 1;
             gmii_rx_state.gmii_rx.rx_dv <= 0;
             gmii_rx_state.gmii_rx.rxd <= 0x0e;
+        }
+        case gmii_rx_action_count_errors_for_resync: {
+            gmii_rx_state.error_count <= gmii_rx_state.error_count + 1;
+            if (gmii_rx_state.error_count==-1) {
+                gmii_rx_state.fsm_state <= gmii_rx_fsm_sync;
+            }
         }
         case gmii_rx_action_lose_sync: { // from invalid
             gmii_rx_state.fsm_state <= gmii_rx_fsm_wait_for_k;
@@ -1347,7 +1399,7 @@ if (request) {
         }
 
         gmii_rx_state.gmii_rx.rx_crs <= 0;
-        gmii_rx_state.gmii_rx_enable <= gmii_rx_state.serial_data_valid;
+        gmii_rx_state.gmii_rx_enable <= gmii_rx_combs.symbol_valid;
         gmii_rx = gmii_rx_state.gmii_rx;
         gmii_rx_enable = gmii_rx_state.gmii_rx_enable;
         
@@ -1390,21 +1442,29 @@ if (request) {
         sgmii_gasket_status.trace.debug_count       <= gmii_rx_state.debug_count;
         sgmii_gasket_status.trace.seeking_comma     <= gmii_rx_combs.seeking_comma;
         sgmii_gasket_status.trace.rx_sync           <= sgmii_gasket_status.rx_sync;
-        sgmii_gasket_status.trace.symbol_valid      <= gmii_rx_state.serial_data_valid;
+        sgmii_gasket_status.trace.symbol_valid      <= gmii_rx_combs.symbol_valid;
         sgmii_gasket_status.trace.symbol_is_control <= gmii_rx_decoded_symbol.is_control;
         sgmii_gasket_status.trace.symbol_data       <= gmii_rx_decoded_symbol.data;
-        sgmii_gasket_status.trace.symbol_is_K       <= gmii_rx_state.serial_data_valid && gmii_rx_combs.symbol_is_K;
-        sgmii_gasket_status.trace.symbol_is_S       <= gmii_rx_state.serial_data_valid && gmii_rx_combs.symbol_is_S;
-        sgmii_gasket_status.trace.symbol_is_V       <= gmii_rx_state.serial_data_valid && gmii_rx_combs.symbol_is_V;
-        sgmii_gasket_status.trace.symbol_is_T       <= gmii_rx_state.serial_data_valid && gmii_rx_combs.symbol_is_T;
-        sgmii_gasket_status.trace.symbol_is_R       <= gmii_rx_state.serial_data_valid && gmii_rx_combs.symbol_is_R;
+        sgmii_gasket_status.trace.symbol_is_K       <= gmii_rx_combs.symbol_valid && gmii_rx_combs.symbol_is_K;
+        sgmii_gasket_status.trace.symbol_is_S       <= gmii_rx_combs.symbol_valid && gmii_rx_combs.symbol_is_S;
+        sgmii_gasket_status.trace.symbol_is_V       <= gmii_rx_combs.symbol_valid && gmii_rx_combs.symbol_is_V;
+        sgmii_gasket_status.trace.symbol_is_T       <= gmii_rx_combs.symbol_valid && gmii_rx_combs.symbol_is_T;
+        sgmii_gasket_status.trace.symbol_is_R       <= gmii_rx_combs.symbol_valid && gmii_rx_combs.symbol_is_R;
     }
     
     /*b Rx GMII domain logging */
     default clock             rx_clk;
     default reset active_low  rx_reset_n;
     rx_gmii_logging:{
-        if (gmii_rx_state.serial_data_valid) {
+        if (gmii_rx_state.gmii_rx_enable) {
+            if (gmii_rx_state.gmii_rx.rx_dv || gmii_rx_state.gmii_rx.rx_er) {
+                log("GMII_rx",
+                    "dv",gmii_rx_state.gmii_rx.rx_dv,
+                    "er",gmii_rx_state.gmii_rx.rx_er,
+                    "data",gmii_rx_state.gmii_rx.rxd);
+            }
+        }
+        if (gmii_rx_combs.symbol_valid) {
             if (gmii_rx_decoded_symbol.is_control) {
                 log("GMII rx control",
                     "symbol",gmii_rx_decoded_symbol.data,

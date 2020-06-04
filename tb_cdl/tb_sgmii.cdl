@@ -21,49 +21,32 @@ include "encoding.h"
 include "gmii_modules.h"
 include "encoders.h"
 
-/*a External modules */
-extern module se_test_harness( clock clk,
-                               output t_gmii_tx gmii_tx,
-                               input bit gmii_tx_enable "With a 2/5 tx_clk to tx_clk_312_5 this will never gap",
-                               input t_tbi_valid tbi_tx "Optional TBI instead of SGMII",
-                               input bit[4] sgmii_txd,
-
-                               output bit[4] sgmii_rxd,
-                               output t_tbi_valid tbi_rx "Optional TBI instead of SGMII",
-                               input t_gmii_rx gmii_rx,
-
-                               output  t_sgmii_gasket_control sgmii_gasket_control "Control of gasket, on rx_clk",
-                               input t_sgmii_gasket_status  sgmii_gasket_status  "Status from gasket, on rx_clk"
-                               
-    )
-{
-    timing to   rising clock clk gmii_tx_enable, tbi_tx, sgmii_txd;
-    timing from rising clock clk gmii_tx;
-
-    timing to   rising clock clk gmii_rx;
-    timing from rising clock clk sgmii_rxd, tbi_rx;
-
-    timing from rising clock clk sgmii_gasket_control;
-    timing to   rising clock clk sgmii_gasket_status;
-}
-
 /*a Module */
 module tb_sgmii( clock clk,
-                 input bit reset_n
-)
+                 input bit reset_n,
+                 input t_gmii_tx gmii_tx,
+                 output bit gmii_tx_enable "With a 2/5 tx_clk to tx_clk_312_5 this will never gap",
+                 output t_tbi_valid tbi_tx "Optional TBI instead of SGMII",
+                 output bit[4] sgmii_txd,
+
+                 input bit[4] sgmii_rxd,
+                 input t_tbi_valid tbi_rx "Optional TBI instead of SGMII",
+                 output bit gmii_rx_enable "With a 2/5 tx_clk to tx_clk_312_5 this will never gap",
+                 output t_gmii_rx gmii_rx,
+
+                 input  t_sgmii_gasket_control sgmii_gasket_control "Control of gasket, on rx_clk",
+                 output t_sgmii_gasket_status  sgmii_gasket_status  "Status from gasket, on rx_clk"
+ )
 {
 
     /*b Nets */
-    net t_gmii_tx gmii_tx;
     net bit gmii_tx_enable "With a 2/5 tx_clk to tx_clk_312_5 this will never gap";
+    net bit gmii_rx_enable "With a 2/5 tx_clk to tx_clk_312_5 this will never gap";
     net t_tbi_valid tbi_tx "Optional TBI instead of SGMII";
     net bit[4] sgmii_txd;
 
-    net bit[4] sgmii_rxd;
-    net t_tbi_valid tbi_rx "Optional TBI instead of SGMII";
     net t_gmii_rx gmii_rx;
 
-    net  t_sgmii_gasket_control sgmii_gasket_control "Control of gasket, on rx_clk";
     net t_sgmii_gasket_status   sgmii_gasket_status  "Status from gasket, on rx_clk";
 
     clocked clock clk reset active_low reset_n t_8b10b_symbol  tbi_tx_symbol={*=0};
@@ -73,20 +56,6 @@ module tb_sgmii( clock clk,
 
     /*b Instantiations */
     instantiations: {
-        se_test_harness th( clk <- clk,
-                            gmii_tx => gmii_tx,
-                            gmii_tx_enable <= gmii_tx_enable,
-                            tbi_tx <= tbi_tx,
-                            sgmii_txd <= sgmii_txd,
-
-                            sgmii_rxd => sgmii_rxd,
-                            tbi_rx => tbi_rx,
-                            gmii_rx <= gmii_rx,
-
-                            sgmii_gasket_control => sgmii_gasket_control,
-                            sgmii_gasket_status  <= sgmii_gasket_status
-                            
-            );
         sgmii_gmii_gasket sgg(tx_clk <- clk,
                               tx_clk_312_5 <- clk,
                               rx_clk <- clk,
@@ -104,6 +73,7 @@ module tb_sgmii( clock clk,
                               sgmii_rxd <= sgmii_stream[4;1],
                               tbi_rx <= tbi_rx,
                               gmii_rx => gmii_rx,
+                              gmii_rx_enable => gmii_rx_enable,
 
                               sgmii_gasket_control <= sgmii_gasket_control,
                               sgmii_gasket_status  => sgmii_gasket_status

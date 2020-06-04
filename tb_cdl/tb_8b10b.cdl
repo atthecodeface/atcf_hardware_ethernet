@@ -19,47 +19,32 @@
 include "encoding.h"
 include "encoders.h"
 
-/*a External modules */
-extern module se_test_harness( clock clk,
-                               output t_8b10b_symbol    dec_symbol,
-                               output t_8b10b_enc_data  enc_data,
-                               input t_8b10b_dec_data  dec_data,
-                               input t_8b10b_symbol    enc_symbol
-    )
-{
-    timing to   rising clock clk dec_data, enc_symbol;
-    timing from rising clock clk dec_symbol, enc_data;
-}
-
 /*a Module */
 module tb_8b10b( clock clk,
-                 input bit reset_n
+                 input bit reset_n,
+                 input t_8b10b_symbol     dec_symbol,
+                 input t_8b10b_enc_data   enc_data,
+                 output t_8b10b_dec_data  dec_data,
+                 output t_8b10b_symbol    enc_symbol
 )
 {
     /*b Nets */
     default clock clk;
     default reset active_low reset_n;
-    net t_8b10b_symbol    dec_symbol;
-    net t_8b10b_enc_data  enc_data ;
-    net t_8b10b_dec_data  dec_data ;
-    net t_8b10b_symbol    enc_symbol;
-    clocked t_8b10b_dec_data  dec_data_r   = {*=0} ;
-    clocked t_8b10b_symbol    enc_symbol_r = {*=0} ;
+    net t_8b10b_dec_data  dec_data_int ;
+    net t_8b10b_symbol    enc_symbol_int;
+    clocked t_8b10b_dec_data  dec_data   = {*=0} ;
+    clocked t_8b10b_symbol    enc_symbol = {*=0} ;
 
     /*b Instantiations */
     instantiations: {
         encode_8b10b enc( enc_data <= enc_data,
-                          symbol => enc_symbol );
+                          symbol => enc_symbol_int );
         decode_8b10b dec( symbol <= dec_symbol,
-                          dec_data => dec_data);
-        se_test_harness th( clk <- clk,
-                            enc_data   => enc_data,
-                            dec_symbol => dec_symbol,
-                            enc_symbol <= enc_symbol_r,
-                            dec_data   <= dec_data_r
-            );
-        enc_symbol_r <= enc_symbol;
-        dec_data_r <= dec_data;
+                          dec_data => dec_data_int);
+        enc_symbol <= enc_symbol_int;
+        dec_data <= dec_data_int;
+
         /*b All done */
     }
 
