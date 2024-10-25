@@ -262,6 +262,7 @@ CRC-32 of 0xffffffff = 0xC704DD7B, bit reversed to 0xdebb20e3
         if (tx_combs.shift_data) {
             tx_state.axi4s.t.data[24;0] <= tx_state.axi4s.t.data[24;8];
             tx_state.axi4s.t.strb <= tx_state.axi4s.t.strb>>1;
+            tx_state.axi4s.t.keep <= tx_state.axi4s.t.keep>>1;
         }
         if (tx_combs.consuming_axi4s) {
             tx_state.axi4s.valid <= 0;                
@@ -281,7 +282,7 @@ CRC-32 of 0xffffffff = 0xC704DD7B, bit reversed to 0xdebb20e3
     tx_fsm : {
         /*b Decode AXI state for FSM */
         tx_combs.data_invalid    = !tx_state.axi4s.valid;
-        tx_combs.last_byte_of_packet = (tx_state.axi4s.t.strb<2) && tx_state.axi4s.t.last;
+        tx_combs.last_byte_of_packet = (tx_state.axi4s.t.keep<2) && tx_state.axi4s.t.last;
         tx_state.ipg <= 12;
         tx_combs.can_output_symbol = (!tx_state.gmii_tx_valid) || gmii_tx_enable;
         tx_combs.padding_required = (tx_state.byte_of_packet<59);
@@ -693,6 +694,7 @@ CRC-32 of 0xffffffff = 0xC704DD7B, bit reversed to 0xdebb20e3
             rx_state.axi4s.t <= {*=0};
             rx_state.axi4s.t.data <= rx_state.data_word;
             rx_state.axi4s.t.strb <= rx_state.byte_valid;
+            rx_state.axi4s.t.keep <= rx_state.byte_valid;
             rx_state.axi4s.t.user[32;0] <= rx_state.user;
             rx_state.axi4s.t.last <= 0;
             if (rx_combs.store_status) {
