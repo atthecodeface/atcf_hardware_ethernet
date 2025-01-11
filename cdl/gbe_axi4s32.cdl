@@ -232,7 +232,7 @@ module gbe_axi4s32( clock  tx_aclk   "Transmit clock domain - AXI-4-S and GMII T
                     output t_packet_stat rx_packet_stat "Packet statistic when packet completes rx",
                     input  bit           rx_packet_stat_ack "Ack for packet statistic",
                     
-                    input t_timer_control rx_timer_control "Timer control in RX clock domain - tie all low if no timestamp required"
+                    input t_timer_control_full rx_timer_control "Timer control in RX clock domain - tie all low if no timestamp required"
     )
 /*b Documentation */
 """
