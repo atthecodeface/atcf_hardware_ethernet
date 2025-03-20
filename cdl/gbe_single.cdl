@@ -335,7 +335,7 @@ module gbe_single( clock clk,
     net bit[28] trace_sgmii_rxd;
     net t_analyzer_tgt analyzer_tgt;
     net t_analyzer_ctl analyzer_ctl;
-    comb t_analyzer_data analyzer_data;
+    comb t_analyzer_data4 analyzer_data;
     analyzer_trace : {
         async_reduce2_4_28_r sgmii_rxd_trace_reduce( clk_in <- sgmii_rx_clk,
                                                     clk_out <- clk,
@@ -359,7 +359,10 @@ module gbe_single( clock clk,
                          analyzer_data <= analyzer_data
             );
         analyzer_data.valid = 1;
-        analyzer_data.data[32;0] = analyzer_trace;
+        analyzer_data.data_0 = analyzer_trace;
+        analyzer_data.data_1 = 0;
+        analyzer_data.data_2 = 0;
+        analyzer_data.data_3 = 0;
         full_switch (analyzer_ctl.mux_control) {
         case 0: { analyzer_trace <= bundle( 4b0, gmii_tx.txd, 1b0, gmii_tx.tx_er, gmii_tx.tx_en, selected_gmii_tx_enable,
                                             4b0, selected_gmii_rx.rxd, selected_gmii_rx.rx_crs, selected_gmii_rx.rx_er, selected_gmii_rx.rx_dv, selected_gmii_rx_enable );
